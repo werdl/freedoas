@@ -708,6 +708,36 @@ int main(int argc, char *argv[]) {
     }
     argv_new[argc - 1] = NULL;
 
+    // elevate privileges to the target user
+    if (selected_rule->target.is_user) {
+        if (selected_rule->target.is_numeric) {
+            if (setuid(selected_rule->target.id.uid) < 0) {
+                log_msg(LOG_ERR, "setuid failed: %s", strerror(errno));
+                die("setuid failed: %s", strerror(errno));
+            }
+        } else {
+            uid_t target_uid = resolve_uid(selected_rule->target.name.user);
+            if (setuid(target_uid) < 0) {
+                log_msg(LOG_ERR, "setuid failed: %s", strerror(errno));
+                die("setuid failed: %s", strerror(errno));
+            }
+        }
+    } else {
+        // setgid
+        if (selected_rule->target.is_numeric) {
+            if (setgid(selected_rule->target.id.gid) < 0) {
+                log_msg(LOG_ERR, "setgid failed: %s", strerror(errno));
+                die("setgid failed: %s", strerror(errno));
+            }
+        } else {
+            gid_t target_gid = resolve_gid(selected_rule->target.name.group);
+            if (setgid(target_gid) < 0) {
+                log_msg(LOG_ERR, "setgid failed: %s", strerror(errno));
+                die("setgid failed: %s", strerror(errno));
+            }
+        }
+    }
+
     execvp(argv1, argv_new);
     log_msg(LOG_ERR, "execvp failed: %s", strerror(errno));
     die("execvp failed: %s", strerror(errno));
