@@ -20,17 +20,25 @@
  * written by werdl (github.com/werdl) :)
  */
 
+#include <errno.h>
+#include <fcntl.h>
+#include <grp.h>
+#include <pwd.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <syslog.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <sys/types.h>
-#include <sys/mman.h>
+
+#ifndef __OpenBSD__
+#include <crypt.h>
+#endif
 
 enum Action {
     ACTION_PERMIT,
@@ -53,12 +61,13 @@ typedef struct {
 
 typedef struct {
     union {
-        char *user;
         uid_t uid;
-
-        char *group;
         gid_t gid;
-    } identity;      // User or group identity
+    } id; // User or group ID
+    union {
+        char *user;  // User name
+        char *group; // Group name
+    } name;          // User or group name
     bool is_user;    // true if user, false if group
     bool is_numeric; // true if uid/gid is numeric, false if it's a name
 } Identity;
@@ -91,33 +100,102 @@ void do_die(int line, const char *file, const char *fmt, ...) {
 
 #define die(...) do_die(__LINE__, __FILE__, __VA_ARGS__)
 
-enum ParseError { PARSE_OK, PARSE_TOO_MANY_RULES, PARSE_BAD_PERMS_ON_CONFIG };
-
 bool check_perms(const char *file) {
     struct stat st;
     if (stat(file, &st) < 0)
         return false;
     if (st.st_uid != 0)
         return false;
-    
+
     // file must be writable only by root, and owned by root
-    if ((st.st_mode & (S_IWGRP | S_IWOTH)) != 0) // no group or other write permissions
+    if ((st.st_mode & (S_IWGRP | S_IWOTH)) !=
+        0) // no group or other write permissions
         return false;
     if ((st.st_mode & S_IRUSR) == 0) // must be readable by user (root)
         return false;
     return true;
 }
 
+bool is_num(const char *str) {
+    while (*str) {
+        if (*str < '0' || *str > '9') {
+            return false;
+        }
+        str++;
+    }
+    return true;
+}
+
+void print_rule(const Rule *rule) {
+    printf("Action: %s\n", rule->action == ACTION_PERMIT ? "permit" : "deny");
+    printf("Options: nopass=%d, nolog=%d, persist=%d, keepenv=%d\n",
+           rule->options.nopass, rule->options.nolog, rule->options.persist,
+           rule->options.keepenv);
+    if (rule->identity.is_user) {
+        if (rule->identity.is_numeric) {
+            printf("Identity: uid=%d\n", rule->identity.id.uid);
+        } else {
+            printf("Identity: user=%s\n", rule->identity.name.user);
+        }
+    } else {
+        if (rule->identity.is_numeric) {
+            printf("Identity: gid=%d\n", rule->identity.id.gid);
+        } else {
+            printf("Identity: group=%s\n", rule->identity.name.group);
+        }
+    }
+    if (rule->target.is_user) {
+        if (rule->target.is_numeric) {
+            printf("Target: uid=%d\n", rule->target.id.uid);
+        } else {
+            printf("Target: user=%s\n", rule->target.name.user);
+        }
+    } else {
+        if (rule->target.is_numeric) {
+            printf("Target: gid=%d\n", rule->target.id.gid);
+        } else {
+            printf("Target: group=%s\n", rule->target.name.group);
+        }
+    }
+    if (rule->argv) {
+        printf("Command: ");
+        for (int i = 0; i < rule->argc; i++) {
+            printf("%s ", rule->argv[i]);
+        }
+        printf("\n");
+    } else {
+        printf("Command: none\n");
+    }
+}
+
+int our_strtonum(const char *str, int min, int max, const char **errstr) {
+    char *endptr;
+    long val = strtol(str, &endptr, 10);
+
+    if (endptr == str || *endptr != '\0') {
+        *errstr = "not a number";
+        return -1;
+    }
+
+    if (val < min || val > max) {
+        *errstr = "out of range";
+        return -1;
+    }
+
+    *errstr = NULL; // No error
+    return (int)val;
+}
+
 // parse in config from a file. if file is NULL, the default config file
 // (/etc/doas.conf) is used.
-int parse(char *file, Rule **rules, int *rule_count) {
+void parse(char *file, Rule **rules, int *rule_num) {
     if (file == NULL) {
-        file = "/etc/doas.conf";
+        file = "doas.conf";
     }
 
     if (!check_perms(file)) {
         log_msg(LOG_ERR, "bad permissions on %s", file);
-        return PARSE_BAD_PERMS_ON_CONFIG;
+        die("bad permissions on %s", file);
     }
 
     int fd = open(file, O_RDONLY);
@@ -126,51 +204,346 @@ int parse(char *file, Rule **rules, int *rule_count) {
     int len = lseek(fd, 0, SEEK_END);
     char *data = mmap(0, len, PROT_READ, MAP_PRIVATE, fd, 0);
 
-    printf("data: %s\n", data);
+    printf("Parsing %s", data);
 
     int i = 0;
-    int rule_num = 0;
 
-    char *line = malloc(len + 1);
-
-    if (!line) {
-        close(fd);
-        die("malloc");
-    }
-    
     int rule_size = 10;
     *rules = malloc(sizeof(Rule) * rule_size);
     if (!*rules) {
-        free(line);
         close(fd);
         die("malloc");
     }
 
     while (i < len) {
-        // empty buffer
-        for (int j = 0; line[j]; j++) {
-            line[j] = '\0';
-        }
+        char *line = malloc(len + 1);
+        if (!line)
+            die("malloc");
 
-        // read a line from the buffer
+        char *last = NULL;
+
         int j = 0;
         while (i < len && data[i] != '\n' && data[i] != '\r') {
             if (j >= len) {
-                fprintf(stderr, "Line too long in %s\n", file);
                 free(line);
                 close(fd);
-                return PARSE_TOO_MANY_RULES;
+                die("Line too long");
             }
             line[j++] = data[i++];
         }
+        line[j] = '\0';
+        i += (data[i] == '\n' || data[i] == '\r') ? 1 : 0;
 
-        printf("line: %s\n", line);
+        char *permit_or_deny = strtok_r(line, " ", &last);
 
+        if (!permit_or_deny) {
+            continue; // empty line
+        }
+
+        if (!strcmp(permit_or_deny, "permit")) {
+            (*rules)[*rule_num].action = ACTION_PERMIT;
+        } else if (!strcmp(permit_or_deny, "deny")) {
+            (*rules)[*rule_num].action = ACTION_DENY;
+        } else {
+            fprintf(stderr, "Invalid action '%s' in %s\n", permit_or_deny,
+                    file);
+            free(line);
+            close(fd);
+            die("Invalid action '%s' in %s", permit_or_deny, file);
+        }
+
+        (*rules)[*rule_num].options.nopass = false;
+        (*rules)[*rule_num].options.nolog = false;
+        (*rules)[*rule_num].options.persist = false;
+        (*rules)[*rule_num].options.keepenv = false;
+        (*rules)[*rule_num].options.env = NULL;
+
+        // parse options
+        char *option = strtok_r(NULL, " ", &last);
+        while (option) {
+            if (!strcmp(option, "nopass")) {
+                (*rules)[*rule_num].options.nopass = true;
+            } else if (!strcmp(option, "nolog")) {
+                (*rules)[*rule_num].options.nolog = true;
+            } else if (!strcmp(option, "persist")) {
+                (*rules)[*rule_num].options.persist = true;
+            } else if (!strcmp(option, "keepenv")) {
+                (*rules)[*rule_num].options.keepenv = true;
+            } else {
+                break; // move to identity parsing
+            }
+            option = strtok_r(NULL, " ", &last);
+        }
+
+        if (!option) {
+            fprintf(stderr, "No identity specified in %s\n", file);
+            free(line);
+            close(fd);
+            die("No identity specified in %s", file);
+        }
+
+        // parse identity
+        char *identity = strdup(option);
+
+        if (!identity) {
+            fprintf(stderr, "No identity specified in %s\n", file);
+            free(line);
+            close(fd);
+            die("No identity specified in %s", file);
+        }
+
+        if (identity[0] == ':') {
+            // group identity
+            if (is_num(identity + 1)) {
+                (*rules)[*rule_num].identity.is_numeric = true;
+                char *errstr = malloc(256);
+                (*rules)[*rule_num].identity.id.gid = our_strtonum(
+                    identity + 1, 0, 65535, (const char **)&errstr);
+                if (errstr) {
+                    fprintf(stderr, "Invalid group ID %s in %s\n", identity,
+                            file);
+                    free(line);
+                    close(fd);
+                    die("Invalid group ID %s in %s", identity, file);
+                }
+            } else {
+                (*rules)[*rule_num].identity.is_numeric = false;
+                (*rules)[*rule_num].identity.name.group = strdup(identity + 1);
+            }
+            (*rules)[*rule_num].identity.is_user = false;
+        } else {
+            // user identity
+            if (is_num(identity)) {
+                (*rules)[*rule_num].identity.is_numeric = true;
+                char *errstr = malloc(256);
+                (*rules)[*rule_num].identity.id.uid =
+                    our_strtonum(identity, 0, 65535, (const char **)&errstr);
+                if (errstr) {
+                    fprintf(stderr, "Invalid user ID %s in %s: %s\n", identity, errstr,
+                            file);
+                    free(line);
+                    close(fd);
+                    die("Invalid user ID %s in %s", identity, file);
+                }
+            } else {
+                (*rules)[*rule_num].identity.is_numeric = false;
+                (*rules)[*rule_num].identity.name.user = strdup(identity);
+            }
+            (*rules)[*rule_num].identity.is_user = true;
+        }
+
+        char *tok = strtok_r(NULL, " ", &last);
+        char *as = tok ? strdup(tok) : NULL;
+
+        if (!as || !strcmp(as, "cmd")) { // if as user is skipped, the next part
+                                         // of the syntax is the command
+            (*rules)[*rule_num].target.is_user = true;
+            (*rules)[*rule_num].target.is_numeric = true; // default to numeric
+            (*rules)[*rule_num].target.id.uid = 0;        // default to root
+        } else if (!strcmp(as, "as")) {
+            // target identity specified
+            fprintf(stderr, "Expected as keyword, not %s in %s\n", as, file);
+            free(line);
+            close(fd);
+            die("Expected as keyword, not %s in %s", as, file);
+        } else {
+            char *target_identity = strtok(NULL, " ");
+            if (!target_identity) {
+                fprintf(stderr, "No target identity specified in %s\n", file);
+                free(line);
+                close(fd);
+                die("No target identity specified in %s", file);
+            }
+
+            if (!target_identity) {
+                fprintf(stderr, "No target identity specified in %s\n", file);
+                free(line);
+                close(fd);
+                die("No target identity specified in %s", file);
+            }
+
+            if (target_identity[0] == ':') {
+                // group target identity
+                if (is_num(target_identity + 1)) {
+                    (*rules)[*rule_num].target.is_numeric = true;
+                    (*rules)[*rule_num].target.id.gid =
+                        atoi(target_identity + 1);
+                } else {
+                    (*rules)[*rule_num].target.is_numeric = false;
+                    (*rules)[*rule_num].target.name.group =
+                        strdup(target_identity + 1);
+                }
+                (*rules)[*rule_num].target.is_user = false;
+            } else {
+                // user target identity
+                if (is_num(target_identity)) {
+                    (*rules)[*rule_num].target.is_numeric = true;
+                    (*rules)[*rule_num].target.id.uid = atoi(target_identity);
+                } else {
+                    (*rules)[*rule_num].target.is_numeric = false;
+                    (*rules)[*rule_num].target.name.user =
+                        strdup(target_identity);
+                }
+                (*rules)[*rule_num].target.is_user = true;
+            }
+        }
+
+        // parse command
+        char *cmd = strtok_r(NULL, " ", &last);
+        if (!cmd) {
+            (*rules)[*rule_num].argv = NULL; // no command specified
+            (*rules)[*rule_num].argc = 0;
+        } else {
+
+            // allocate memory for argv
+            (*rules)[*rule_num].argv = malloc(sizeof(char *) * 10);
+            if (!(*rules)[*rule_num].argv) {
+                free(line);
+                close(fd);
+                die("malloc");
+            }
+
+            (*rules)[*rule_num].argc = 0;
+            while (cmd) {
+                if ((*rules)[*rule_num].argc >= 10) {
+                    // realloc if needed
+                    (*rules)[*rule_num].argv = realloc(
+                        (*rules)[*rule_num].argv,
+                        sizeof(char *) * ((*rules)[*rule_num].argc + 10));
+                    if (!(*rules)[*rule_num].argv) {
+                        free(line);
+                        close(fd);
+                        die("realloc");
+                    }
+                }
+                (*rules)[*rule_num].argv[(*rules)[*rule_num].argc++] =
+                    strdup(cmd);
+                cmd = strtok_r(NULL, " ", &last);
+            }
+        }
+
+        (*rule_num)++;
+
+        if (*rule_num >= rule_size) {
+            rule_size *= 2;
+            *rules = realloc(*rules, sizeof(Rule) * rule_size);
+            if (!*rules) {
+                free(line);
+                close(fd);
+                die("realloc");
+            }
+        }
     }
 
+    // clean up
+    munmap(data, len);
+    close(fd);
+}
 
+gid_t *get_all_gids(void) {
+    int gidsetlen = getgroups(0, NULL);
+    if (gidsetlen < 0) {
+        die("getgroups failed");
+    }
 
-    return PARSE_OK;
+    gid_t *gids = malloc(sizeof(gid_t) * gidsetlen);
+    if (!gids) {
+        die("malloc");
+    }
+
+    if (getgroups(gidsetlen, gids) < 0) {
+        free(gids);
+        die("getgroups failed");
+    }
+    return gids;
+}
+
+gid_t resolve_gid(const char *name) {
+    if (is_num(name)) {
+        return (gid_t)atoi(name);
+    }
+
+    struct group *grp = getgrnam(name);
+    if (!grp) {
+        log_msg(LOG_ERR, "Group %s not found", name);
+        die("Group %s not found", name);
+    }
+    return grp->gr_gid;
+}
+
+uid_t resolve_uid(const char *name) {
+    if (is_num(name)) {
+        return (uid_t)atoi(name);
+    }
+
+    struct passwd *pwd = getpwnam(name);
+    if (!pwd) {
+        log_msg(LOG_ERR, "User %s not found", name);
+        die("User %s not found", name);
+    }
+    return pwd->pw_uid;
+}
+
+bool password_check() {
+    // confirm that the user knows their own password
+    char *hostname = malloc(256);
+    if (!hostname) {
+        die("malloc");
+    }
+
+    if (gethostname(hostname, 256) < 0) {
+        die("gethostname failed");
+    }
+
+    char *username = getlogin();
+
+    if (!username) {
+        die("getlogin failed");
+    }
+
+    char *buf = malloc(strlen(hostname) + strlen(username) + 50);
+
+    snprintf(buf, strlen(hostname) + strlen(username) + 50,
+             "doas (%s@%s) password: ", username, hostname);
+
+    // prompt for password
+    char *password = getpass(buf);
+    free(buf);
+
+    if (!password) {
+        log_msg(LOG_ERR, "getpass failed");
+        die("getpass failed");
+    }
+
+    // check if the password is correct
+#ifdef __linux__
+    // on linux, we use /etc/shadow to check the password
+    struct spwd *sp = getspnam(getlogin());
+    if (!sp) {
+        log_msg(LOG_ERR, "User %s not found in /etc/shadow", getlogin());
+        die("User %s not found in /etc/shadow", getlogin());
+    }
+
+    if (strcmp(sp->sp_pwdp, crypt(password, sp->sp_pwdp)) != 0) {
+        log_msg(LOG_ERR, "Password check failed for user %s", getlogin());
+        return false;
+    }
+#else
+    // on other systems, we use the passwd file
+    struct passwd *pwd = getpwnam_shadow(getlogin());
+    if (!pwd) {
+        log_msg(LOG_ERR, "User %s not found in /etc/passwd", getlogin());
+        die("User %s not found in /etc/passwd", getlogin());
+    }
+
+    if (strcmp(pwd->pw_passwd, crypt(password, pwd->pw_passwd)) != 0) {
+        log_msg(LOG_ERR, "Password check failed for user %s", getlogin());
+        return false;
+    }
+#endif
+
+    log_msg(LOG_DEBUG, "Password check succeeded for user %s", getlogin());
+    return true;
 }
 
 int main(int argc, char *argv[]) {
@@ -179,7 +552,7 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    setuid(0); // Run as root to read protected files
+    seteuid(0); // Run as root to read protected files
 
     openlog("freedoas", LOG_PID | LOG_CONS, LOG_AUTH);
 
@@ -212,5 +585,130 @@ int main(int argc, char *argv[]) {
     Rule *rules = NULL;
 
     int rule_count = 0;
-    int parse_result = parse(NULL, &rules, &rule_count);
+    parse(NULL, &rules, &rule_count);
+
+    // first, find a rule relevant to the user
+    Rule **matched_rules = malloc(sizeof(Rule *) * rule_count);
+    if (!matched_rules) {
+        die("malloc");
+    }
+
+    uid_t current_uid = getuid();
+    gid_t *gids = get_all_gids();
+
+    char *login_name = getlogin();
+
+    int matched_count = 0;
+    for (int i = 0; i < rule_count; i++) {
+        Rule *rule = &rules[i];
+
+        // Check if the rule matches the user
+        if (rule->identity.is_user) {
+            if (rule->identity.is_numeric) {
+                if (rule->identity.id.uid == current_uid) {
+                    matched_rules[matched_count++] = rule;
+                }
+            } else {
+                if (!strcmp(rule->identity.name.user, login_name)) {
+                    matched_rules[matched_count++] = rule;
+                }
+            }
+        } else {
+            gid_t rule_gid;
+
+            if (rule->identity.is_numeric) {
+                rule_gid = rule->identity.id.gid;
+            } else {
+                rule_gid = resolve_gid(rule->identity.name.group);
+            }
+
+            for (int j = 0; j < getgroups(0, NULL); j++) {
+                if (gids[j] == rule_gid) {
+                    matched_rules[matched_count++] = rule;
+                    break; // No need to check other gids
+                }
+            }
+        }
+    }
+    free(gids);
+
+    // now, check if any of the matched rules allow the command
+    Rule *selected_rule = NULL;
+
+    for (int i = 0; i < matched_count; i++) {
+        Rule *rule = matched_rules[i];
+
+        // Check if the rule matches the command
+        if (rule->argc == 0 ||
+            (rule->argv && strcmp(rule->argv[0], argv[1]) == 0)) {
+            selected_rule = rule;
+            continue; // last matching rule
+        }
+
+        if (rule->argc >= argc) {
+            bool match = true;
+            for (int j = 0; j < rule->argc && j < argc; j++) {
+                if (!rule->argv[j]) {
+                    match = false;
+                    break; // no command specified in rule
+                }
+
+                if (!argv[j]) {
+                    // might still match if rule has more args than argv
+                    break;
+                }
+
+                if (strcmp(rule->argv[j], argv[j])) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                selected_rule = rule;
+                continue; // last matching rule
+            }
+        }
+    }
+
+    free(matched_rules);
+
+    print_rule(selected_rule);
+
+    if (!selected_rule) {
+        log_msg(LOG_ERR, "No matching rule found for command %s", argv[1]);
+        die("No matching rule found for command %s", argv[1]);
+    }
+
+    if (selected_rule->action == ACTION_DENY) {
+        log_msg(LOG_ERR, "Command %s denied by rule", argv[1]);
+        die("Command %s denied by rule", argv[1]);
+    }
+
+    if (!selected_rule->options.nopass && !password_check()) {
+        log_msg(LOG_ERR, "Password check failed for command %s", argv[1]);
+        die("Password check failed for command %s", argv[1]);
+    }
+
+    char **argv_new = malloc(sizeof(char *) * (argc - 1));
+    if (!argv_new) {
+        die("malloc");
+    }
+
+    char *argv1 = strdup(argv[1]);
+    if (!argv1) {
+        die("strdup");
+    }
+    argv_new[0] = argv1;
+
+    for (int i = 2; i < argc; i++) {
+        argv_new[i - 1] = strdup(argv[i]);
+        if (!argv_new[i - 1]) {
+            die("strdup");
+        }
+    }
+    argv_new[argc - 1] = NULL;
+
+    execvp(argv1, argv_new);
+    log_msg(LOG_ERR, "execvp failed: %s", strerror(errno));
+    die("execvp failed: %s", strerror(errno));
 }
