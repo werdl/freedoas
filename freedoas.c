@@ -35,6 +35,8 @@
 #include <sys/wait.h>
 #include <syslog.h>
 #include <unistd.h>
+#include <sys/time.h>
+#include <time.h>
 
 #ifndef __OpenBSD__
 #include <crypt.h>
@@ -186,6 +188,95 @@ int our_strtonum(const char *str, int min, int max, const char **errstr) {
     return (int)val;
 }
 
+// create or update the lockfile for user `uid`
+void lockfile(uid_t uid) {
+    char *lock_path = malloc(256);
+    if (!lock_path) {
+        die("malloc");
+    }
+
+    if (snprintf(lock_path, 256, "/tmp/freedoas.lock.%d", uid) < 0) {
+        free(lock_path);
+        die("snprintf");
+    }
+
+    int fd = open(lock_path, O_CREAT | O_EXCL | O_RDWR | O_TRUNC, 0600);
+
+    if (fd < 0) {
+        if (errno == EEXIST) {
+            fd = open(lock_path, O_RDWR | O_TRUNC, 0600);
+
+            if (fd < 0) die("open");
+        } else {
+            die("open");
+        }
+    }
+
+    char num[15];
+
+    snprintf(num, 15, "%lld", time(NULL));
+
+    if (write(fd, num, strlen(num)) < 0) {
+        close(fd);
+        free(lock_path);
+        die("write");
+    }
+}
+
+long long safe_atoll(char *input) {
+    char *endptr;
+    long long value = strtoll(input, &endptr, 10);
+
+    if (endptr == input || *endptr != '\0') {
+        log_msg(LOG_ERR, "Invalid number: %s", input);
+        die("Invalid number: %s", input);
+    }
+
+    return value;
+}
+
+// confirm if user `uid` is locked out
+bool are_locked(uid_t uid) {
+    char *lock_path = malloc(256);
+    if (!lock_path) {
+        die("malloc");
+    }
+
+    if (snprintf(lock_path, 256, "/tmp/freedoas.lock.%d", uid) < 0) {
+        free(lock_path);
+        die("snprintf");
+    }
+
+    int fd = open(lock_path, O_RDONLY);
+
+    if (fd < 0) {
+        if (errno == ENOENT) {
+            free(lock_path);
+            return false; // no lock file means not locked
+        } else {
+            free(lock_path);
+            die("open");
+        }
+    }
+
+    char buf[15];
+    ssize_t len = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+
+    if (len < 0) {
+        free(lock_path);
+        die("read");
+    }
+
+    buf[len] = '\0';
+
+    long long timestamp = safe_atoll(buf);
+
+    free(lock_path);
+
+    return time(NULL) - timestamp < 300; // 5 minutes
+}
+
 // parse in config from a file. if file is NULL, the default config file
 // (/etc/doas.conf) is used.
 void parse(char *file, Rule **rules, int *rule_num) {
@@ -203,8 +294,6 @@ void parse(char *file, Rule **rules, int *rule_num) {
     // map file to a buffer
     int len = lseek(fd, 0, SEEK_END);
     char *data = mmap(0, len, PROT_READ, MAP_PRIVATE, fd, 0);
-
-    printf("Parsing %s", data);
 
     int i = 0;
 
@@ -394,7 +483,6 @@ void parse(char *file, Rule **rules, int *rule_num) {
             (*rules)[*rule_num].argv = NULL; // no command specified
             (*rules)[*rule_num].argc = 0;
         } else {
-
             // allocate memory for argv
             (*rules)[*rule_num].argv = malloc(sizeof(char *) * 10);
             if (!(*rules)[*rule_num].argv) {
@@ -552,6 +640,8 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
+    uid_t original_uid = getuid();
+
     seteuid(0); // Run as root to read protected files
 
     openlog("freedoas", LOG_PID | LOG_CONS, LOG_AUTH);
@@ -568,7 +658,7 @@ int main(int argc, char *argv[]) {
 
     for (int i = 2; i < argc; i++) {
         if (used_bytes + strlen(argv[i]) + 1 >= (unsigned long)size) {
-            size *= 2;
+                size *= 2;
             log_buf = realloc(log_buf, size);
             if (!log_buf)
                 die("realloc");
@@ -672,8 +762,6 @@ int main(int argc, char *argv[]) {
 
     free(matched_rules);
 
-    print_rule(selected_rule);
-
     if (!selected_rule) {
         log_msg(LOG_ERR, "No matching rule found for command %s", argv[1]);
         die("No matching rule found for command %s", argv[1]);
@@ -684,10 +772,25 @@ int main(int argc, char *argv[]) {
         die("Command %s denied by rule", argv[1]);
     }
 
-    if (!selected_rule->options.nopass && !password_check()) {
-        log_msg(LOG_ERR, "Password check failed for command %s", argv[1]);
-        die("Password check failed for command %s", argv[1]);
+    bool should_check = true;
+
+    if (selected_rule->options.persist) {
+        // check if the user is locked out
+        if (are_locked(original_uid)) {
+            should_check = false;
+        }
     }
+
+    if (selected_rule->options.nopass) should_check = false;
+
+    if (should_check) {
+        if (!password_check()) {
+            log_msg(LOG_ERR, "Password check failed for command %s", argv[1]);
+            die("Password check failed for command %s", argv[1]);
+        }
+    }
+
+    lockfile(original_uid);
 
     char **argv_new = malloc(sizeof(char *) * (argc - 1));
     if (!argv_new) {
