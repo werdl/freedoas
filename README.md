@@ -6,6 +6,10 @@
 - i am a student, not a security expert
 - i am not responsible for any damage caused by this software
 - if you want to use it, i strongly recommend you to either use opendoas, or if you want to use this one, ensure that a. you know what you are doing and b. you delete the binary after you are done with it (unless you want to leave a random setuid binary on your system)
+## Why?
+- freedoas is designed to be as portable as possible, and to be as near possible to OpenBSD's doas
+- it is written in C, and uses only POSIX-compatible libraries, thus it should compile on any POSIX-compatible system
+- the only non-POSIX feature it uses it `passwd.pw_passwd`, but if a platform does not support it, please post an issue and i will add a workaround, like using `getspnam` for linux
 ## Features
 - freedoas aims to be a drop-in replacement for OpenBSD's doas
 - it currently supports all but the following features of OpenBSD's doas:
