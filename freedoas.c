@@ -323,7 +323,7 @@ void parse(char *file, Rule **rules, int *rule_num) {
         }
         line[j] = '\0';
         i += (data[i] == '\n' || data[i] == '\r') ? 1 : 0;
-
+ 
         char *permit_or_deny = strtok_r(line, " ", &last);
 
         if (!permit_or_deny) {
@@ -430,14 +430,14 @@ void parse(char *file, Rule **rules, int *rule_num) {
             (*rules)[*rule_num].target.is_user = true;
             (*rules)[*rule_num].target.is_numeric = true; // default to numeric
             (*rules)[*rule_num].target.id.uid = 0;        // default to root
-        } else if (!strcmp(as, "as")) {
+        } else if (strcmp(as, "as") != 0) {
             // target identity specified
             fprintf(stderr, "Expected as keyword, not %s in %s\n", as, file);
             free(line);
             close(fd);
             die("Expected as keyword, not %s in %s", as, file);
         } else {
-            char *target_identity = strtok(NULL, " ");
+            char *target_identity = strtok_r(NULL, " ", &last);
             if (!target_identity) {
                 fprintf(stderr, "No target identity specified in %s\n", file);
                 free(line);
@@ -826,7 +826,46 @@ int main(int argc, char *argv[]) {
         // Check if the rule matches the command
         if (rule->argc == 0 ||
             (rule->argv && strcmp(rule->argv[0], actual_argv[0]) == 0)) {
-            selected_rule = rule;
+            if (rule->target.is_user) {
+                if (rule->target.is_numeric) {
+                    if (rule->target.id.uid == target_uid) {
+                        selected_rule = rule;
+                    }
+                } else {
+                    char *our_uname = user;
+                    if (!our_uname) {
+                        our_uname = "root";
+                    }
+
+                    if (user && is_num(user)) {
+                        // if user is numeric, resolve it
+                        uid_t target_uid = resolve_uid(user);
+                        if (rule->target.id.uid == target_uid) {
+                            selected_rule = rule;
+                        }
+                    }
+
+                    if (strcmp(rule->target.name.user, our_uname) == 0) {
+                        selected_rule = rule;
+                    }
+                }
+            } else {
+                if (rule->target.is_numeric) {
+                    if (rule->target.id.gid == getgid()) {
+                        selected_rule = rule;
+                    }
+                } else {
+                    gid_t target_gid = resolve_gid(rule->target.name.group);
+                    gid_t *gids = get_all_gids();
+                    for (int j = 0; j < getgroups(0, NULL); j++) {
+                        if (gids[j] == target_gid) {
+                            selected_rule = rule;
+                            break; // No need to check other gids
+                        }
+                    }
+                    free(gids);
+                }
+            }
             continue; // last matching rule
         }
 
