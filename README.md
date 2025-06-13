@@ -1,6 +1,6 @@
 # freedoas
 > cross-platform clone of OpenBSD's doas
-## DO NOT USE FREEDOAS FOR ACtUAL USE YET!!
+## DO NOT USE FREEDOAS FOR ACTUAL USE YET!!
 - freedoas is NOT extensively tested
 - i test for segfaults and memory leaks, but not for security
 - i am a student, not a security expert
@@ -10,5 +10,4 @@
 - freedoas aims to be a drop-in replacement for OpenBSD's doas
 - it currently supports all but the following features of OpenBSD's doas:
   - environment variables (and environment setup more generally)
-  - flags
-  - persistence (it will parse the `persist` keyword, but it will not do anything with it)
+- it does not and will not support the `-a` flag, but will allow it to ensure compatibility with scripts that use it

@@ -31,12 +31,12 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <syslog.h>
-#include <unistd.h>
-#include <sys/time.h>
 #include <time.h>
+#include <unistd.h>
 
 #ifndef __OpenBSD__
 #include <crypt.h>
@@ -206,7 +206,8 @@ void lockfile(uid_t uid) {
         if (errno == EEXIST) {
             fd = open(lock_path, O_RDWR | O_TRUNC, 0600);
 
-            if (fd < 0) die("open");
+            if (fd < 0)
+                die("open");
         } else {
             die("open");
         }
@@ -281,7 +282,7 @@ bool are_locked(uid_t uid) {
 // (/etc/doas.conf) is used.
 void parse(char *file, Rule **rules, int *rule_num) {
     if (file == NULL) {
-        file = "doas.conf";
+        file = "/etc/doas.conf";
     }
 
     if (!check_perms(file)) {
@@ -408,8 +409,8 @@ void parse(char *file, Rule **rules, int *rule_num) {
                 (*rules)[*rule_num].identity.id.uid =
                     our_strtonum(identity, 0, 65535, (const char **)&errstr);
                 if (errstr) {
-                    fprintf(stderr, "Invalid user ID %s in %s: %s\n", identity, errstr,
-                            file);
+                    fprintf(stderr, "Invalid user ID %s in %s: %s\n", identity,
+                            errstr, file);
                     free(line);
                     close(fd);
                     die("Invalid user ID %s in %s", identity, file);
@@ -572,7 +573,7 @@ uid_t resolve_uid(const char *name) {
     return pwd->pw_uid;
 }
 
-bool password_check() {
+bool password_check(void) {
     // confirm that the user knows their own password
     char *hostname = malloc(256);
     if (!hostname) {
@@ -640,9 +641,68 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
+    int clear_previous_auths = 0;
+    int non_interactive = 0;
+    int exec_shell = 0;
+
+    char *config_file = NULL;
+    char *user = NULL;
+
+    while (1) {
+        int opt = getopt(argc, argv, "u:C:Lnas");
+        if (opt == -1)
+            break;
+
+        switch (opt) {
+        case 'C':
+            config_file = optarg;
+            break;
+        case 'u':
+            user = optarg;
+            break;
+        case 'n':
+            non_interactive = 1;
+            break;
+        case 'a':
+            fprintf(stderr,
+                    "warning: the -a option is not supported by freedoas\n");
+            break;
+        case 's':
+            exec_shell = 1;
+            break;
+        case 'L':
+            clear_previous_auths = 1;
+            break;
+        default:
+            fprintf(
+                stderr,
+                "Usage: %s [-Lns] [-C config] [-u user] command [arg ...]\n",
+                argv[0]);
+            exit(EXIT_FAILURE);
+        }
+    }
+
     uid_t original_uid = getuid();
 
     seteuid(0); // Run as root to read protected files
+
+    if (clear_previous_auths) {
+        // clear previous authorizations
+        char *lock_path = malloc(256);
+        if (!lock_path) {
+            die("malloc");
+        }
+
+        if (snprintf(lock_path, 256, "/tmp/freedoas.lock.%d", original_uid) <
+            0) {
+            free(lock_path);
+            die("snprintf");
+        }
+
+        unlink(lock_path);
+        free(lock_path);
+        return 0; // Exit after clearing authorizations
+    }
 
     openlog("freedoas", LOG_PID | LOG_CONS, LOG_AUTH);
 
@@ -658,7 +718,7 @@ int main(int argc, char *argv[]) {
 
     for (int i = 2; i < argc; i++) {
         if (used_bytes + strlen(argv[i]) + 1 >= (unsigned long)size) {
-                size *= 2;
+            size *= 2;
             log_buf = realloc(log_buf, size);
             if (!log_buf)
                 die("realloc");
@@ -675,7 +735,7 @@ int main(int argc, char *argv[]) {
     Rule *rules = NULL;
 
     int rule_count = 0;
-    parse(NULL, &rules, &rule_count);
+    parse(config_file, &rules, &rule_count);
 
     // first, find a rule relevant to the user
     Rule **matched_rules = malloc(sizeof(Rule *) * rule_count);
@@ -722,15 +782,50 @@ int main(int argc, char *argv[]) {
     }
     free(gids);
 
+    if (matched_count == 0) {
+        log_msg(LOG_ERR, "No matching rules found for user %s", login_name);
+        die("No matching rules found for user %s", login_name);
+    }
+
+    uid_t target_uid = 0;
+
+    if (user) {
+        if (is_num(user)) {
+            target_uid = resolve_uid(user);
+        } else {
+            target_uid = resolve_uid(user);
+        }
+    }
+
     // now, check if any of the matched rules allow the command
     Rule *selected_rule = NULL;
+
+    char **actual_argv = malloc(sizeof(char *) * (argc - optind + 1));
+
+    if (exec_shell) {
+        // if -s is specified, we use the shell as the command
+        actual_argv = malloc(sizeof(char *) * 2);
+        if (!actual_argv) {
+            die("malloc");
+        }
+
+        struct passwd *pwd = getpwuid(target_uid);
+
+        actual_argv[0] = pwd ? pwd->pw_shell : "/bin/sh";
+        actual_argv[1] = NULL;
+    } else {
+        for (int i = optind; i < argc; i++) {
+            actual_argv[i - optind] = strdup(argv[i]);
+        }
+        actual_argv[argc - optind] = NULL;
+    }
 
     for (int i = 0; i < matched_count; i++) {
         Rule *rule = matched_rules[i];
 
         // Check if the rule matches the command
         if (rule->argc == 0 ||
-            (rule->argv && strcmp(rule->argv[0], argv[1]) == 0)) {
+            (rule->argv && strcmp(rule->argv[0], actual_argv[0]) == 0)) {
             selected_rule = rule;
             continue; // last matching rule
         }
@@ -748,7 +843,7 @@ int main(int argc, char *argv[]) {
                     break;
                 }
 
-                if (strcmp(rule->argv[j], argv[j])) {
+                if (strcmp(rule->argv[j], actual_argv[j]) != 0) {
                     match = false;
                     break;
                 }
@@ -763,13 +858,13 @@ int main(int argc, char *argv[]) {
     free(matched_rules);
 
     if (!selected_rule) {
-        log_msg(LOG_ERR, "No matching rule found for command %s", argv[1]);
-        die("No matching rule found for command %s", argv[1]);
+        log_msg(LOG_ERR, "No matching rule found for command %s", argv[optind]);
+        die("No matching rule found for command %s", argv[optind]);
     }
 
     if (selected_rule->action == ACTION_DENY) {
-        log_msg(LOG_ERR, "Command %s denied by rule", argv[1]);
-        die("Command %s denied by rule", argv[1]);
+        log_msg(LOG_ERR, "Command %s denied by rule", argv[optind]);
+        die("Command %s denied by rule", argv[optind]);
     }
 
     bool should_check = true;
@@ -781,35 +876,23 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    if (selected_rule->options.nopass) should_check = false;
+    if (selected_rule->options.nopass)
+        should_check = false;
 
     if (should_check) {
+        if (non_interactive) {
+            log_msg(LOG_ERR, "Password check required in non-interactive mode");
+            die("Password check required in non-interactive mode");
+        }
+
         if (!password_check()) {
-            log_msg(LOG_ERR, "Password check failed for command %s", argv[1]);
-            die("Password check failed for command %s", argv[1]);
+            log_msg(LOG_ERR, "Password check failed for command %s",
+                    argv[optind]);
+            die("Password check failed for command %s", argv[optind]);
         }
     }
 
     lockfile(original_uid);
-
-    char **argv_new = malloc(sizeof(char *) * (argc - 1));
-    if (!argv_new) {
-        die("malloc");
-    }
-
-    char *argv1 = strdup(argv[1]);
-    if (!argv1) {
-        die("strdup");
-    }
-    argv_new[0] = argv1;
-
-    for (int i = 2; i < argc; i++) {
-        argv_new[i - 1] = strdup(argv[i]);
-        if (!argv_new[i - 1]) {
-            die("strdup");
-        }
-    }
-    argv_new[argc - 1] = NULL;
 
     // elevate privileges to the target user
     if (selected_rule->target.is_user) {
@@ -841,7 +924,10 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    execvp(argv1, argv_new);
+    if (exec_shell)
+        execvp(actual_argv[0], NULL);
+
+    execvp(actual_argv[0], actual_argv);
     log_msg(LOG_ERR, "execvp failed: %s", strerror(errno));
     die("execvp failed: %s", strerror(errno));
 }
