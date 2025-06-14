@@ -13,5 +13,5 @@
 ## Features
 - freedoas aims to be a drop-in replacement for OpenBSD's doas
 - it currently supports all but the following features of OpenBSD's doas:
-  - environment variables (and environment setup more generally)
+  - preservation of specific environment variables
 - it does not and will not support the `-a` flag, but will allow it to ensure compatibility with scripts that use it

@@ -229,7 +229,7 @@ long long safe_atoll(char *input) {
     long long value = strtoll(input, &endptr, 10);
 
     if (endptr == input || *endptr != '\0') {
-        log_msg(LOG_ERR, "Invalid number: %s", input);
+        log_msg(LOG_NOTICE, "Invalid number: %s", input);
         die("Invalid number: %s", input);
     }
 
@@ -286,7 +286,7 @@ void parse(char *file, Rule **rules, int *rule_num) {
     }
 
     if (!check_perms(file)) {
-        log_msg(LOG_ERR, "bad permissions on %s", file);
+        log_msg(LOG_NOTICE, "bad permissions on %s", file);
         die("bad permissions on %s", file);
     }
 
@@ -323,7 +323,7 @@ void parse(char *file, Rule **rules, int *rule_num) {
         }
         line[j] = '\0';
         i += (data[i] == '\n' || data[i] == '\r') ? 1 : 0;
- 
+
         char *permit_or_deny = strtok_r(line, " ", &last);
 
         if (!permit_or_deny) {
@@ -453,17 +453,7 @@ void parse(char *file, Rule **rules, int *rule_num) {
             }
 
             if (target_identity[0] == ':') {
-                // group target identity
-                if (is_num(target_identity + 1)) {
-                    (*rules)[*rule_num].target.is_numeric = true;
-                    (*rules)[*rule_num].target.id.gid =
-                        atoi(target_identity + 1);
-                } else {
-                    (*rules)[*rule_num].target.is_numeric = false;
-                    (*rules)[*rule_num].target.name.group =
-                        strdup(target_identity + 1);
-                }
-                (*rules)[*rule_num].target.is_user = false;
+                die("Target identity cannot be a group in %s", file);
             } else {
                 // user target identity
                 if (is_num(target_identity)) {
@@ -554,7 +544,7 @@ gid_t resolve_gid(const char *name) {
 
     struct group *grp = getgrnam(name);
     if (!grp) {
-        log_msg(LOG_ERR, "Group %s not found", name);
+        log_msg(LOG_NOTICE, "Group %s not found", name);
         die("Group %s not found", name);
     }
     return grp->gr_gid;
@@ -567,7 +557,7 @@ uid_t resolve_uid(const char *name) {
 
     struct passwd *pwd = getpwnam(name);
     if (!pwd) {
-        log_msg(LOG_ERR, "User %s not found", name);
+        log_msg(LOG_NOTICE, "User %s not found", name);
         die("User %s not found", name);
     }
     return pwd->pw_uid;
@@ -600,7 +590,7 @@ bool password_check(void) {
     free(buf);
 
     if (!password) {
-        log_msg(LOG_ERR, "getpass failed");
+        log_msg(LOG_NOTICE, "getpass failed");
         die("getpass failed");
     }
 
@@ -609,24 +599,24 @@ bool password_check(void) {
     // on linux, we use /etc/shadow to check the password
     struct spwd *sp = getspnam(getlogin());
     if (!sp) {
-        log_msg(LOG_ERR, "User %s not found in /etc/shadow", getlogin());
+        log_msg(LOG_NOTICE, "User %s not found in /etc/shadow", getlogin());
         die("User %s not found in /etc/shadow", getlogin());
     }
 
     if (strcmp(sp->sp_pwdp, crypt(password, sp->sp_pwdp)) != 0) {
-        log_msg(LOG_ERR, "Password check failed for user %s", getlogin());
+        log_msg(LOG_NOTICE, "Password check failed for user %s", getlogin());
         return false;
     }
 #else
     // on other systems, we use the passwd file
     struct passwd *pwd = getpwnam_shadow(getlogin());
     if (!pwd) {
-        log_msg(LOG_ERR, "User %s not found in /etc/passwd", getlogin());
+        log_msg(LOG_NOTICE, "User %s not found in /etc/passwd", getlogin());
         die("User %s not found in /etc/passwd", getlogin());
     }
 
     if (strcmp(pwd->pw_passwd, crypt(password, pwd->pw_passwd)) != 0) {
-        log_msg(LOG_ERR, "Password check failed for user %s", getlogin());
+        log_msg(LOG_NOTICE, "Password check failed for user %s", getlogin());
         return false;
     }
 #endif
@@ -783,7 +773,7 @@ int main(int argc, char *argv[]) {
     free(gids);
 
     if (matched_count == 0) {
-        log_msg(LOG_ERR, "No matching rules found for user %s", login_name);
+        log_msg(LOG_NOTICE, "No matching rules found for user %s", login_name);
         die("No matching rules found for user %s", login_name);
     }
 
@@ -811,7 +801,9 @@ int main(int argc, char *argv[]) {
 
         struct passwd *pwd = getpwuid(target_uid);
 
-        actual_argv[0] = pwd ? pwd->pw_shell : "/bin/sh";
+        actual_argv[0] = getenv("SHELL") ? strdup(getenv("SHELL"))
+                         : pwd->pw_shell ? strdup(pwd->pw_shell)
+                                         : strdup("/bin/sh");
         actual_argv[1] = NULL;
     } else {
         for (int i = optind; i < argc; i++) {
@@ -897,12 +889,13 @@ int main(int argc, char *argv[]) {
     free(matched_rules);
 
     if (!selected_rule) {
-        log_msg(LOG_ERR, "No matching rule found for command %s", argv[optind]);
+        log_msg(LOG_NOTICE, "No matching rule found for command %s",
+                argv[optind]);
         die("No matching rule found for command %s", argv[optind]);
     }
 
     if (selected_rule->action == ACTION_DENY) {
-        log_msg(LOG_ERR, "Command %s denied by rule", argv[optind]);
+        log_msg(LOG_NOTICE, "Command %s denied by rule", argv[optind]);
         die("Command %s denied by rule", argv[optind]);
     }
 
@@ -920,13 +913,12 @@ int main(int argc, char *argv[]) {
 
     if (should_check) {
         if (non_interactive) {
-            log_msg(LOG_ERR, "Password check required in non-interactive mode");
+            log_msg(LOG_NOTICE,
+                    "Password check required in non-interactive mode");
             die("Password check required in non-interactive mode");
         }
 
         if (!password_check()) {
-            log_msg(LOG_ERR, "Password check failed for command %s",
-                    argv[optind]);
             die("Password check failed for command %s", argv[optind]);
         }
     }
@@ -935,38 +927,102 @@ int main(int argc, char *argv[]) {
 
     // elevate privileges to the target user
     if (selected_rule->target.is_user) {
-        if (selected_rule->target.is_numeric) {
-            if (setuid(selected_rule->target.id.uid) < 0) {
-                log_msg(LOG_ERR, "setuid failed: %s", strerror(errno));
-                die("setuid failed: %s", strerror(errno));
-            }
+        uid_t uid = selected_rule->target.is_numeric
+                        ? selected_rule->target.id.uid
+                        : resolve_uid(selected_rule->target.name.user);
+
+        // first, let us check if we should keep the environment
+        if (selected_rule->options.keepenv) {
         } else {
-            uid_t target_uid = resolve_uid(selected_rule->target.name.user);
-            if (setuid(target_uid) < 0) {
-                log_msg(LOG_ERR, "setuid failed: %s", strerror(errno));
-                die("setuid failed: %s", strerror(errno));
+            extern char **environ;
+            // clear the environment, except for DISPLAY, TERM and PATH
+            char *display = getenv("DISPLAY");
+            char *term = getenv("TERM");
+            char *path = getenv("PATH");
+            for (int i = 0; environ[i]; i++) {
+                if (strncmp(environ[i], "DISPLAY=", 8) != 0 &&
+                    strncmp(environ[i], "TERM=", 5) != 0 &&
+                    strncmp(environ[i], "PATH=", 5) != 0) {
+                    char *eq = strchr(environ[i], '=');
+                    if (eq) {
+                        *eq = '\0';
+                    }
+                    unsetenv(eq ? eq : environ[i]);
+                }
+            }
+
+            if (display) {
+                setenv("DISPLAY", display, 1);
+            }
+            if (term) {
+                setenv("TERM", term, 1);
+            }
+            if (path) {
+                setenv("PATH", path, 1);
+            }
+
+            struct passwd *pwd = getpwuid(uid);
+
+            if (!pwd) {
+                log_msg(LOG_NOTICE, "User %d not found", uid);
+                die("User %d not found", uid);
+            }
+
+            if (!true) {
+                log_msg(LOG_NOTICE, "Original user %d not found", original_uid);
+                die("Original user %d not found", original_uid);
+            }
+
+            // set the environment variables from the passwd entry
+            if (pwd->pw_shell) {
+                setenv("SHELL", pwd->pw_shell, 1);
+            } else {
+                setenv("SHELL", "/bin/sh", 1);
+            }
+
+            if (pwd->pw_dir) {
+                setenv("HOME", pwd->pw_dir, 1);
+            }
+
+            if (pwd->pw_name) {
+                setenv("USER", pwd->pw_name, 1);
+                setenv("LOGNAME", pwd->pw_name, 1);
+            }
+
+            struct passwd *original_pwd = getpwnam(getlogin());
+
+            if (original_pwd->pw_name) {
+                setenv("DOAS_USER", original_pwd->pw_name, 1);
             }
         }
+
+        struct passwd *pwd = getpwuid(uid);
+
+        if (initgroups(pwd->pw_name, pwd->pw_gid) < 0) {
+            log_msg(LOG_NOTICE, "initgroups failed: %s", strerror(errno));
+            die("initgroups failed: %s", strerror(errno));
+        }
+
+        if (setgid(pwd->pw_gid) < 0) {
+            log_msg(LOG_NOTICE, "setgid failed: %s", strerror(errno));
+            die("setgid failed: %s", strerror(errno));
+        }
+
+        if (setuid(uid) < 0) {
+            log_msg(LOG_NOTICE, "setuid failed: %s", strerror(errno));
+            die("setuid failed: %s", strerror(errno));
+        }
+        //        umask(umask_value);
+
     } else {
-        // setgid
-        if (selected_rule->target.is_numeric) {
-            if (setgid(selected_rule->target.id.gid) < 0) {
-                log_msg(LOG_ERR, "setgid failed: %s", strerror(errno));
-                die("setgid failed: %s", strerror(errno));
-            }
-        } else {
-            gid_t target_gid = resolve_gid(selected_rule->target.name.group);
-            if (setgid(target_gid) < 0) {
-                log_msg(LOG_ERR, "setgid failed: %s", strerror(errno));
-                die("setgid failed: %s", strerror(errno));
-            }
-        }
+        // this should fail in the parsing stage, but just in case
+        die("target identity is a group, not a user, which is not supported");
     }
 
     if (exec_shell)
         execvp(actual_argv[0], NULL);
 
     execvp(actual_argv[0], actual_argv);
-    log_msg(LOG_ERR, "execvp failed: %s", strerror(errno));
+    log_msg(LOG_NOTICE, "execvp failed: %s", strerror(errno));
     die("execvp failed: %s", strerror(errno));
 }
