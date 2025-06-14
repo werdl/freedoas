@@ -15,3 +15,9 @@
 - it currently supports all but the following features of OpenBSD's doas:
   - preservation of specific environment variables
 - it does not and will not support the `-a` flag, but will allow it to ensure compatibility with scripts that use it
+## Installation
+- freedoas is a single C file for easy compilation
+- alternatively, a Makefile is provided for easy compilation
+- use `make dev` to compile the development version, which includes debugging helpers and is not stripped
+- use `make release` to compile the release version, which is stripped and does not include debugging helpers
+- use `make install` to install the binary to `/usr/local/bin/freedoas`, as well as the man files to correct locations (check Makefile if you want to change the install locations, you need to on OpenBSD for example)

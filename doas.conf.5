@@ -1,0 +1,104 @@
+.TH DOAS.CONF 5 "June 2025" "freedoas" "File Formats"
+.SH NAME
+doas.conf \- configuration file for freedoas
+.SH DESCRIPTION
+The
+.I doas.conf
+file defines which users may execute commands via
+.B freedoas(1),
+under what conditions, and as which target users.
+
+The default path is
+.I /etc/doas.conf,
+but an alternate path may be specified via the
+.B \-C
+option.
+
+.SH SYNTAX
+Each line contains a rule of the form:
+.PP
+.EX
+permit|deny [options] identity [as target] [command ...]
+.EE
+
+Rules are processed from top to bottom, with the last matching rule taking precedence.
+
+.PP
+Comments start with
+.B #
+and extend to the end of the line.
+
+.SH FIELDS
+.TP
+.B permit|deny
+Whether to allow or reject the command.
+.TP
+.B options
+Optional keywords described below.
+.TP
+.B identity
+A username, UID, group name (prefixed with
+.BR : ),
+or GID (also with
+.BR : ).
+.TP
+.B as target
+(Optional) target user to run the command as. Defaults to root.
+.TP
+.B command ...
+(Optional) Command and arguments. If omitted, any command is allowed. If present, the provided command and arguments must match.
+
+.SH OPTIONS
+.TP
+.B nopass
+Do not require password authentication.
+.TP
+.B nolog
+Do not log this command to syslog.
+.TP
+.B persist
+Retain authentication status for a period (default 5 minutes), or until cleared with
+.B freedoas \-L.
+.TP
+.B keepenv
+Preserve the listed environment variables from the caller's session.
+
+.SH MATCHING BEHAVIOUR
+The last rule that matches is applied. If no rule matches, the command is denied.
+
+.SH EXAMPLES
+Permit user alice to run any command as root:
+.PP
+.EX
+permit alice
+.EE
+
+Allow bob to run
+.B reboot
+without a password:
+.PP
+.EX
+permit nopass bob as root reboot
+.EE
+
+Deny a group from running
+.B shutdown:
+.PP
+.EX
+deny :nogroup as root shutdown
+.EE
+
+.SH FILES
+.TP
+.I /etc/doas.conf
+Default configuration file.
+
+.SH SEE ALSO
+.BR freedoas (1),
+.BR sudoers (5)
+
+.SH AUTHORS
+Written by werdl <werdl_@outlook.com>
+.PP
+OpenBSD doas written by Ted Unangst <tedu@openbsd.org>
+

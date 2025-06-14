@@ -1,6 +1,6 @@
 /*
  * freedoas - a cross-platform clone of OpenBSD's doas authorization tool
- * freedoas is licensed under the GPLv3 or later, see LICENSE for details
+ * freedoas is free software licensed under the GPLv3 or later, see LICENSE for details
  *
  * freedoas should run on any system that has a struct passwd with a pw_password
  * field, although there is special logic for Linux which uses /etc/shadow. if
@@ -11,13 +11,13 @@
  * - NetBSD
  * - DragonFly BSD
  * - macOS
- * - linux (tested on arch and debian, but should work on any linux distro that
- * has libc and /etc/shadow support)
+ * - Linux
  *
  * freedoas will probably work on other propietary Unices, but I haven't tested
  * it
  *
- * written by werdl (github.com/werdl) :)
+ * written by werdl <werdl_@outlook.com> :)
+ * OpenBSD doas written by Ted Unangst <tedu@openbsd.org>
  */
 
 #include <errno.h>
@@ -41,6 +41,10 @@
 #ifndef __OpenBSD__
 #include <crypt.h>
 #endif
+
+#define WAIT_TIME 300 // 5 minutes
+#define USAGE "usage: %s [-Lns] [-C config] [-u user] command [arg ...]\n"
+#define DEFAULT_CONFIG "/etc/doas.conf"
 
 enum Action {
     ACTION_PERMIT,
@@ -93,7 +97,11 @@ void log_msg(int level, const char *fmt, ...) {
 void do_die(int line, const char *file, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
+#ifdef DEV
     fprintf(stderr, "%s:%d: ", file, line);
+#else
+    fprintf(stderr, "freedoas: ");
+#endif
     vfprintf(stderr, fmt, args);
     fprintf(stderr, "\n");
     va_end(args);
@@ -229,7 +237,6 @@ long long safe_atoll(char *input) {
     long long value = strtoll(input, &endptr, 10);
 
     if (endptr == input || *endptr != '\0') {
-        log_msg(LOG_NOTICE, "Invalid number: %s", input);
         die("Invalid number: %s", input);
     }
 
@@ -275,18 +282,17 @@ bool are_locked(uid_t uid) {
 
     free(lock_path);
 
-    return time(NULL) - timestamp < 300; // 5 minutes
+    return time(NULL) - timestamp < WAIT_TIME; // 5 minutes
 }
 
 // parse in config from a file. if file is NULL, the default config file
-// (/etc/doas.conf) is used.
+// (DEFAULT_CONFIG, usually /etc/doas.conf) is used.
 void parse(char *file, Rule **rules, int *rule_num) {
     if (file == NULL) {
-        file = "/etc/doas.conf";
+        file = DEFAULT_CONFIG;
     }
 
     if (!check_perms(file)) {
-        log_msg(LOG_NOTICE, "bad permissions on %s", file);
         die("bad permissions on %s", file);
     }
 
@@ -323,6 +329,11 @@ void parse(char *file, Rule **rules, int *rule_num) {
         }
         line[j] = '\0';
         i += (data[i] == '\n' || data[i] == '\r') ? 1 : 0;
+
+        if (j == 0 || line[0] == '#') {
+            free(line);
+            continue; // skip empty lines and comments
+        }
 
         char *permit_or_deny = strtok_r(line, " ", &last);
 
@@ -544,7 +555,6 @@ gid_t resolve_gid(const char *name) {
 
     struct group *grp = getgrnam(name);
     if (!grp) {
-        log_msg(LOG_NOTICE, "Group %s not found", name);
         die("Group %s not found", name);
     }
     return grp->gr_gid;
@@ -557,7 +567,6 @@ uid_t resolve_uid(const char *name) {
 
     struct passwd *pwd = getpwnam(name);
     if (!pwd) {
-        log_msg(LOG_NOTICE, "User %s not found", name);
         die("User %s not found", name);
     }
     return pwd->pw_uid;
@@ -590,8 +599,7 @@ bool password_check(void) {
     free(buf);
 
     if (!password) {
-        log_msg(LOG_NOTICE, "getpass failed");
-        die("getpass failed");
+        die("getpass");
     }
 
     // check if the password is correct
@@ -611,23 +619,20 @@ bool password_check(void) {
     // on other systems, we use the passwd file
     struct passwd *pwd = getpwnam_shadow(getlogin());
     if (!pwd) {
-        log_msg(LOG_NOTICE, "User %s not found in /etc/passwd", getlogin());
         die("User %s not found in /etc/passwd", getlogin());
     }
 
     if (strcmp(pwd->pw_passwd, crypt(password, pwd->pw_passwd)) != 0) {
-        log_msg(LOG_NOTICE, "Password check failed for user %s", getlogin());
         return false;
     }
 #endif
 
-    log_msg(LOG_DEBUG, "Password check succeeded for user %s", getlogin());
     return true;
 }
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <command>\n", argv[0]);
+        fprintf(stderr, USAGE, argv[0]);
         exit(EXIT_FAILURE);
     }
 
@@ -664,12 +669,14 @@ int main(int argc, char *argv[]) {
             clear_previous_auths = 1;
             break;
         default:
-            fprintf(
-                stderr,
-                "Usage: %s [-Lns] [-C config] [-u user] command [arg ...]\n",
-                argv[0]);
+            fprintf(stderr, USAGE, argv[0]);
             exit(EXIT_FAILURE);
         }
+    }
+
+    if (optind >= argc && !clear_previous_auths && !exec_shell) {
+        fprintf(stderr, USAGE, argv[0]);
+        exit(EXIT_FAILURE);
     }
 
     uid_t original_uid = getuid();
@@ -689,9 +696,14 @@ int main(int argc, char *argv[]) {
             die("snprintf");
         }
 
-        unlink(lock_path);
+        if (unlink(lock_path) < 0) {
+            if (errno != ENOENT) {
+                free(lock_path);
+                die("unlink");
+            }
+        }
         free(lock_path);
-        return 0; // Exit after clearing authorizations
+        return 0; // exit after clearing authorizations
     }
 
     openlog("freedoas", LOG_PID | LOG_CONS, LOG_AUTH);
@@ -719,7 +731,6 @@ int main(int argc, char *argv[]) {
         used_bytes += strlen(argv[i]);
     }
 
-    log_msg(LOG_DEBUG, "%s", log_buf);
     free(log_buf);
 
     Rule *rules = NULL;
@@ -889,13 +900,10 @@ int main(int argc, char *argv[]) {
     free(matched_rules);
 
     if (!selected_rule) {
-        log_msg(LOG_NOTICE, "No matching rule found for command %s",
-                argv[optind]);
         die("No matching rule found for command %s", argv[optind]);
     }
 
     if (selected_rule->action == ACTION_DENY) {
-        log_msg(LOG_NOTICE, "Command %s denied by rule", argv[optind]);
         die("Command %s denied by rule", argv[optind]);
     }
 
@@ -913,8 +921,6 @@ int main(int argc, char *argv[]) {
 
     if (should_check) {
         if (non_interactive) {
-            log_msg(LOG_NOTICE,
-                    "Password check required in non-interactive mode");
             die("Password check required in non-interactive mode");
         }
 
@@ -964,12 +970,10 @@ int main(int argc, char *argv[]) {
             struct passwd *pwd = getpwuid(uid);
 
             if (!pwd) {
-                log_msg(LOG_NOTICE, "User %d not found", uid);
                 die("User %d not found", uid);
             }
 
             if (!true) {
-                log_msg(LOG_NOTICE, "Original user %d not found", original_uid);
                 die("Original user %d not found", original_uid);
             }
 
@@ -999,17 +1003,14 @@ int main(int argc, char *argv[]) {
         struct passwd *pwd = getpwuid(uid);
 
         if (initgroups(pwd->pw_name, pwd->pw_gid) < 0) {
-            log_msg(LOG_NOTICE, "initgroups failed: %s", strerror(errno));
             die("initgroups failed: %s", strerror(errno));
         }
 
         if (setgid(pwd->pw_gid) < 0) {
-            log_msg(LOG_NOTICE, "setgid failed: %s", strerror(errno));
             die("setgid failed: %s", strerror(errno));
         }
 
         if (setuid(uid) < 0) {
-            log_msg(LOG_NOTICE, "setuid failed: %s", strerror(errno));
             die("setuid failed: %s", strerror(errno));
         }
 
@@ -1021,8 +1022,45 @@ int main(int argc, char *argv[]) {
     if (exec_shell)
         execvp(actual_argv[0], NULL);
 
+    pid_t pid = fork();
+    if (pid < 0) {
+        die("fork failed: %s", strerror(errno));
+    }
 
-    execvp(actual_argv[0], actual_argv);
-    log_msg(LOG_NOTICE, "execvp failed: %s", strerror(errno));
-    die("execvp failed: %s", strerror(errno));
+    if (pid == 0) {
+        // child process
+        if (execvp(actual_argv[0], actual_argv) < 0) {
+            log_msg(LOG_NOTICE, "execvp failed: %s", strerror(errno));
+            die("execvp failed: %s", strerror(errno));
+        }
+    } else {
+        // parent process
+        // wait for the child process to finish
+        int status;
+        if (waitpid(pid, &status, 0) < 0) {
+            die("waitpid failed: %s", strerror(errno));
+        }
+
+        if (WIFEXITED(status)) {
+            int exit_status = WEXITSTATUS(status);
+            if (exit_status != 0) {
+                if (!selected_rule->options.nolog) {
+                    log_msg(LOG_NOTICE, "Command exited with status %d",
+                            exit_status);
+                }
+                die("Command exited with status %d", exit_status);
+            }
+        } else if (WIFSIGNALED(status)) {
+            int signal = WTERMSIG(status);
+            if (!selected_rule->options.nolog) {
+                log_msg(LOG_NOTICE, "Command terminated by signal %d", signal);
+            }
+            die("Command terminated by signal %d", signal);
+        } else {
+            if (!selected_rule->options.nolog) {
+                log_msg(LOG_NOTICE, "Command exited abnormally");
+            }
+            die("Command exited abnormally");
+        }
+    }
 }

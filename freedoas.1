@@ -1,0 +1,76 @@
+.TH FREEDOAS 1 "June 2025" "freedoas" "User Commands"
+.SH NAME
+freedoas \- minimal doas-like privilege escalation utility
+.SH SYNOPSIS
+.B freedoas
+[\-Lns] [\-C \fIconfig\fR] [\-u \fIuser\fR] \fIcommand\fR [\fIarg\fR ...]
+.SH DESCRIPTION
+doas is a minimalistic privilege escalation utility originally from OpenBSD, designed to replace the sudo utility. freedoas is a compatible implementation that provides similar functionality with a focus on portability. It should be noted that the freedoas code has not been audited for security vulnerabilities, so it is recommended to use it with caution, or alternatively not use it at all.
+.PP
+The
+.B freedoas
+utility allows a permitted user to run a command as another user, as specified in the configuration file (default:
+.I /etc/doas.conf
+).
+
+Configuration files must be writable only by root. They may be world-readable.
+.PP
+By default, password authentication is required for all commands unless overridden in the configuration.
+.PP
+freedoas creates a clean environment for the command, setting:
+.BR $HOME ,
+.BR $LOGNAME ,
+.BR $USER ,
+and
+.B $SHELL
+based on the target user. The variables
+.BR $DISPLAY ,
+.BR $TERM ,
+and
+.BR $PATH
+are inherited. Other variables are cleared unless explicitly preserved.
+.SH OPTIONS
+.TP
+.B \-L
+Remove the authentication lockfile, forcing password reentry for the next command. Exits immediately.
+.TP
+.B \-n
+Do not prompt for a password. If a password is required, the command fails.
+.TP
+.B \-s
+Run the target user's shell. Uses
+.B $SHELL
+if set, otherwise from
+.I /etc/passwd.
+.TP
+.BI \-C " config"
+Use an alternate configuration file instead of
+.I /etc/doas.conf.
+Must be root-owned and not writable by others.
+.TP
+.BI \-u " user"
+Run the command as the specified user instead of root.
+.SH EXIT STATUS
+.TP
+0
+The command was successfully executed.
+.TP
+1
+An error occurred (invalid config, denied access, command not found, etc).
+.SH FILES
+.TP
+.I /etc/doas.conf
+Default configuration file for rule definitions.
+.SH SEE ALSO
+.BR doas (1),
+.BR doas.conf (5),
+.BR sudo (8)
+.BR su(1),
+
+.SH AUTHORS
+Written by werdl <werdl_@outlook.com>
+.PP
+OpenBSD doas written by Ted Unangst <tedu@openbsd.org>
+.SH LICENSE
+freedoas is free software released under GPLv3 or later.
+
