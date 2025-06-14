@@ -1,6 +1,6 @@
 /*
  * freedoas - a cross-platform clone of OpenBSD's doas authorization tool
- * freedoas is licensed under the MIT license.
+ * freedoas is licensed under the GPLv3 or later, see LICENSE for details
  *
  * freedoas should run on any system that has a struct passwd with a pw_password
  * field, although there is special logic for Linux which uses /etc/shadow. if
@@ -1012,7 +1012,6 @@ int main(int argc, char *argv[]) {
             log_msg(LOG_NOTICE, "setuid failed: %s", strerror(errno));
             die("setuid failed: %s", strerror(errno));
         }
-        //        umask(umask_value);
 
     } else {
         // this should fail in the parsing stage, but just in case
@@ -1021,6 +1020,7 @@ int main(int argc, char *argv[]) {
 
     if (exec_shell)
         execvp(actual_argv[0], NULL);
+
 
     execvp(actual_argv[0], actual_argv);
     log_msg(LOG_NOTICE, "execvp failed: %s", strerror(errno));
